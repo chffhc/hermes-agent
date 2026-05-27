@@ -26,6 +26,56 @@ from typing import Any, Dict, List
 logger = logging.getLogger(__name__)
 
 
+def _text_from_output_items(output_items: List[Any]) -> str:
+    chunks: list[str] = []
+    for item in output_items:
+        content = getattr(item, "content", None)
+        if isinstance(item, dict):
+            content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            ptype = getattr(part, "type", None)
+            text = getattr(part, "text", None)
+            if isinstance(part, dict):
+                ptype = part.get("type")
+                text = part.get("text")
+            if ptype in {"output_text", "text"} and isinstance(text, str) and text:
+                chunks.append(text)
+    return "".join(chunks).strip()
+
+
+def _synthetic_response_from_stream_parts(
+    api_kwargs: dict,
+    *,
+    output_items: List[Any],
+    text_parts: List[str],
+    has_tool_calls: bool = False,
+):
+    assembled = "".join(text_parts or []).strip()
+    output = list(output_items or [])
+    if not output and assembled and not has_tool_calls:
+        output = [SimpleNamespace(
+            type="message",
+            role="assistant",
+            status="completed",
+            content=[SimpleNamespace(type="output_text", text=assembled)],
+        )]
+    if not output:
+        return None
+    if not assembled:
+        assembled = _text_from_output_items(output)
+    return SimpleNamespace(
+        id=None,
+        object="response",
+        status="completed",
+        model=api_kwargs.get("model"),
+        output=output,
+        output_text=assembled,
+        usage=None,
+    )
+
+
 def run_codex_app_server_turn(
     agent,
     *,
@@ -298,6 +348,25 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                             len(agent._codex_streamed_text_parts),
                         )
                 return final_response
+        except TypeError as exc:
+            if "'NoneType' object is not iterable" not in str(exc):
+                raise
+            recovered = _synthetic_response_from_stream_parts(
+                api_kwargs,
+                output_items=collected_output_items,
+                text_parts=getattr(agent, "_codex_streamed_text_parts", []) or [],
+                has_tool_calls=has_tool_calls,
+            )
+            if recovered is None:
+                raise
+            logger.warning(
+                "Codex Responses stream terminal response had output=None; "
+                "recovered from %d output item(s) and %d streamed char(s). %s",
+                len(collected_output_items),
+                len(getattr(recovered, "output_text", "") or ""),
+                agent._client_log_context(),
+            )
+            return recovered
         except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
             if attempt < max_stream_retries:
                 logger.debug(
@@ -484,6 +553,24 @@ def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None
                             len(collected_text_deltas),
                         )
                 return terminal_response
+    except TypeError as exc:
+        if "'NoneType' object is not iterable" not in str(exc):
+            raise
+        recovered = _synthetic_response_from_stream_parts(
+            fallback_kwargs,
+            output_items=collected_output_items,
+            text_parts=collected_text_deltas,
+        )
+        if recovered is None:
+            raise
+        logger.warning(
+            "Codex create(stream=True) terminal response had output=None; "
+            "recovered from %d output item(s) and %d streamed char(s). %s",
+            len(collected_output_items),
+            len(getattr(recovered, "output_text", "") or ""),
+            agent._client_log_context(),
+        )
+        return recovered
     finally:
         close_fn = getattr(stream_or_response, "close", None)
         if callable(close_fn):

@@ -174,6 +174,26 @@ class _FakeResponsesStream:
         return self._final_response
 
 
+class _FakeResponsesStreamWithIterError:
+    def __init__(self, events, error):
+        self._events = list(events)
+        self._error = error
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def __iter__(self):
+        for event in self._events:
+            yield event
+        raise self._error
+
+    def get_final_response(self):
+        raise AssertionError("get_final_response should not run after iterator error")
+
+
 class _FakeCreateStream:
     def __init__(self, events):
         self._events = list(events)
@@ -467,6 +487,42 @@ def test_run_codex_stream_falls_back_to_create_after_stream_completion_error(mon
     assert calls["stream"] == 2
     assert calls["create"] == 1
     assert response.output[0].content[0].text == "create fallback ok"
+
+
+def test_run_codex_stream_recovers_when_completed_response_output_is_none(monkeypatch):
+    """The ChatGPT Codex backend can stream output_item.done and then send
+    response.completed with output=null, which the OpenAI SDK raises as a
+    TypeError while iterating the stream. Recover from the collected events.
+    """
+    agent = _build_agent(monkeypatch)
+    output_item = SimpleNamespace(
+        type="message",
+        role="assistant",
+        status="completed",
+        content=[SimpleNamespace(type="output_text", text="stream recovered")],
+    )
+
+    def _fake_stream(**kwargs):
+        return _FakeResponsesStreamWithIterError(
+            [
+                SimpleNamespace(type="response.created"),
+                SimpleNamespace(type="response.output_text.delta", delta="stream recovered"),
+                SimpleNamespace(type="response.output_item.done", item=output_item),
+            ],
+            TypeError("'NoneType' object is not iterable"),
+        )
+
+    def _unexpected_create(**kwargs):
+        raise AssertionError("stream recovery should not fall back to create")
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(stream=_fake_stream, create=_unexpected_create)
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+    assert response.status == "completed"
+    assert response.output == [output_item]
+    assert response.output_text == "stream recovered"
 
 
 def test_run_codex_stream_fallback_parses_create_stream_events(monkeypatch):
